@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Annotated, TypedDict, List, Dict, Any
+from typing import  TypedDict
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
@@ -12,9 +12,11 @@ import nest_asyncio
 from playwright.async_api import async_playwright
 from pydantic import BaseModel, Field
 from enum import Enum
+import vertexai
+from google.oauth2 import service_account
+from vertexai.generative_models import GenerativeModel
 
-
-from utils import analyze_image_with_pixtral, clean_html
+from utils import analyze_image_with_gemini, analyze_image_with_pixtral, clean_html
 
 # Enable nested asyncio for Jupyter compatibility
 nest_asyncio.apply()
@@ -34,6 +36,7 @@ class Actions(Enum):
     button_click = "button_click"
     fill_field = "fill_field"
     close_page = "close_page"
+    scroll_down = "scroll_down"
     other = "other"
 
 class PageAction(TypedDict):
@@ -62,9 +65,18 @@ class AutoJobApplicant:
         self.agent = None
         self.graph = None
         self.workflow = None
+        self.gemini = None
+        creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        secret = json.loads (creds_json)
+        
+        credentials = service_account.Credentials.from_service_account_info(secret)
 
+        vertexai.init(project="gen-lang-client-0613559779",
+              location="europe-west2",
+              api_key=os.getenv("VERTEX_API_KEY"), credentials=credentials)
     async def initialize(self):
         """Initialize all async components"""
+        self.gemini = GenerativeModel("gemini-1.5-pro-002").start_chat()
         await self.setup_browser_tools()
         self.setup_graph()
         self.save_workflow_graph()
@@ -77,6 +89,7 @@ class AutoJobApplicant:
 
     def setup_graph(self):
         """Setup the LangGraph workflow"""
+        
         self.graph = StateGraph(JobApplicationState)
         # Add nodes for each step of the process with async functions
         self.graph.add_node("start_workflow", self.start_workflow)
@@ -107,7 +120,6 @@ class AutoJobApplicant:
 
     async def start_workflow(self, state: JobApplicationState) -> JobApplicationState:
         print(f"Navigate to {state['url']}")
-        await self.page.set_viewport_size({"width": 1024, "height": 768})
         await self.page.goto(state['url'])
         try:
             await self.page.wait_for_load_state('networkidle',timeout=10000)
@@ -126,7 +138,7 @@ class AutoJobApplicant:
                 print(f"Error waiting for page load: {e}")
                 pass   
             # Get current page content
-            screenshot_bytes = await self.page.screenshot(full_page=True)
+            screenshot_bytes = await self.page.screenshot(full_page=False)
             print("took a screenshot")
             # Save screenshot to local
             with open("screenshot.png", "wb") as f:
@@ -151,7 +163,7 @@ class AutoJobApplicant:
         try:
             
             # Pixtral analysis returns the most appropriate action to take
-            analysis = await analyze_image_with_pixtral(state["screenshot_base64"], state["html_page_content"],state.get("next_action",None), os.getenv("MISTRAL_API_KEY"))
+            analysis = await analyze_image_with_gemini(self.gemini,state["screenshot_base64"], state["html_page_content"],state.get("next_action",None))
             print(analysis)
             
             analysis_prompt = f"""
@@ -167,7 +179,7 @@ class AutoJobApplicant:
             {state['html_page_content']}
 
             Return your response as a JSON object with these fields:
-            - action: The action to take (e.g., "button_click", "close_page")
+            - action: The action to take (e.g., "button_click", "close_page","scroll_down")
             - target: A CSS selector to find the element. Prefer IDs when available, then unique class names, then other attributes.
                     Make the selector as specific as needed to uniquely identify the element.
             - backup_text: The visible text content of the element (if any) as a fallback
@@ -266,6 +278,10 @@ class AutoJobApplicant:
                     await element.fill("amirbrahamm@gmail.com")
                 else:
                     await element.fill("Amir Braham")
+            elif action == Actions.scroll_down.value:
+                print(f"Scrolling down")
+                await self.page.evaluate("window.scrollBy(0, 500)")
+                
 
             # Wait for any navigation or loading
             
