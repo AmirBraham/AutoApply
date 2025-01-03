@@ -1,6 +1,6 @@
 import json
 import re
-from typing import  TypedDict
+from typing import  List, TypedDict
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
@@ -37,6 +37,7 @@ class Actions(Enum):
     fill_field = "fill_field"
     close_page = "close_page"
     scroll_down = "scroll_down"
+    fill_form = "fill_form"  # New action
     other = "other"
 
 class PageAction(TypedDict):
@@ -45,6 +46,32 @@ class PageAction(TypedDict):
     target: str = Field(description="The target element to interact with (ID or classname of the element)")
     backup_text: str = Field(description="The visible text content of the element as a fallback")
 
+
+
+class FormField(BaseModel):
+    field_id: str = Field(description="The ID or selector of the form field")
+    field_type: str  = Field(description="The type of the form field")
+    label: str = Field(description="The label or placeholder text of the form field")
+    
+    
+class Form(BaseModel):
+    """Represents a form with its fields"""
+    form_id: str = Field(description="The ID or selector of the form element")
+    fields: List[FormField] = Field(description="List of form fields")
+
+
+class UserData(BaseModel):
+    """User's personal information for job applications"""
+    full_name: str = "Amir Braham"
+    email: str = "amirbrahamm@gmail.com"
+    phone: str = "+1234567890"
+    linkedin: str = "linkedin.com/in/amirbraham"
+    github: str = "github.com/amirbraham"
+    portfolio: str = "amirbraham.com"
+    education: str = "Bachelor's in Computer Science"
+    years_experience: str = "5"
+    current_company: str = "Tech Corp"
+    current_role: str = "Software Engineer"
 
 
 class AutoJobApplicant:
@@ -169,9 +196,9 @@ class AutoJobApplicant:
             analysis_prompt = f"""
             You are currently on a job application page.
             
-            Based on the provided HTML content and the user instructions, identify the most relevant HTML element to interact with. 
-            Return the best action to take, along with the corresponding selector that would uniquely identify the element.
-
+            Based on the provided HTML content and the user instructions, identify if there's a form to fill or a specific element to interact with.
+            If you see a form with multiple fields (like name, email, etc.), recommend the fill_form action.
+            
             Instructions:
             {analysis}
             
@@ -179,11 +206,17 @@ class AutoJobApplicant:
             {state['html_page_content']}
 
             Return your response as a JSON object with these fields:
-            - action: The action to take (e.g., "button_click", "close_page","scroll_down")
-            - target: A CSS selector to find the element. Prefer IDs when available, then unique class names, then other attributes.
-                    Make the selector as specific as needed to uniquely identify the element.
+            - action: The action to take (e.g., "button_click", "fill_form", "close_page", "scroll_down")
+            - target: For non-form actions, a CSS selector to find the element. For forms, use the form's container selector.
             - backup_text: The visible text content of the element (if any) as a fallback
 
+            If this appears to be a form, prioritize returning:
+            {{
+                "action": "fill_form",
+                "target": "form selector or container",
+                "backup_text": "Form container text"
+            }}
+            
             If this appears to be the final submission page, return:
             {{
                 "action": "close_page",
@@ -223,7 +256,31 @@ class AutoJobApplicant:
             backup_text = next_action.get("backup_text")
             
             print(f"Attempting to perform {action} using selector: {target}")
+            if action == Actions.fill_form.value:
+                # Analyze form fields within the target container
+                form_container = self.page.locator(target)
+                html_content = await form_container.inner_html()
+                html_content = clean_html(html_content)
+                response = await self.analyze_form_fields(html_content)
+                form_id = response.form_id
+                fields = response.fields
+                # Fill each field in the form
+                user_data = UserData()  # Your predefined user data
+                for field in fields:
+                    try:
+                        element = self.page.locator(field.field_id)
+                        value = await self.match_field_to_user_data(field, user_data)
+                        
+                        if value:
+                            await element.fill(value)
+                            print(f"Filled {field.label} with {value}")
+                            await asyncio.sleep(0.5)  # Small delay between fields
+                            
+                    except Exception as e:
+                        print(f"Error filling field {field.label}: {e}")
+                        continue
             
+                return state
             # Try different strategies to find the element
             element = None
             
@@ -290,8 +347,96 @@ class AutoJobApplicant:
         except Exception as e:
             print(f"Error in perform_action: {e}")
             raise
+    
+        
+    async def analyze_form_fields(self, html_content: str):
+        """Analyze the HTML content to identify form fields"""
+        
+        analysis_prompt = f"""
+        Analyze the following HTML content and identify all form fields.
+        For each field, determine:
+        1. The field ID or unique selector
+        2. The field type (text, email, phone, etc.)
+        3. The label or placeholder text
+        4. Whether it's required
+        
+        HTML content:
+        {html_content}
+        
+        Return the analysis as a JSON array of objects with these properties:
+        - field_id: string (CSS selector to uniquely identify the field)
+        - field_type: string
+        - label: string
+        - required: boolean
+        """
+        
+        structured_llm = self.llm.with_structured_output(schema=Form)
+        response = structured_llm.invoke(analysis_prompt)   
+        print(response)
+        return response
 
 
+    async def match_field_to_user_data(self, field: FormField, user_data: UserData) -> str:
+        """Match a form field to the appropriate user data"""
+        
+        matching_prompt = f"""
+        Determine which user data field best matches this form field:
+        
+        Form field:
+        - Label: {field.label}
+        - Type: {field.field_type}
+        
+        Available user data fields:
+        {[field for field in UserData.__annotations__]}
+        
+        Return just the name of the matching field, or "none" if no good match.
+        """
+        
+        response = self.llm.invoke(matching_prompt)
+        response = response.content
+        field_name = response.strip().lower()
+        
+        if field_name in UserData.__annotations__:
+            return getattr(user_data, field_name)
+        return ""
+
+    async def fill_form(self, state: JobApplicationState) -> JobApplicationState:
+        """Fill out the job application form"""
+        try:
+            # Initialize user data
+            user_data = UserData()
+            
+            # Analyze form fields
+            form_fields = await self.analyze_form_fields(state["html_page_content"])
+            
+            # Fill each field
+            for field in form_fields:
+                try:
+                    # Find the element
+                    element = self.page.locator(field.field_id)
+                    
+                    # Get the appropriate user data
+                    value = await self.match_field_to_user_data(field, user_data)
+                    
+                    if value:
+                        await element.fill(value)
+                        print(f"Filled {field.label} with {value}")
+                        
+                    # Wait briefly between fields to avoid triggering anti-bot measures
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    print(f"Error filling field {field.label}: {e}")
+                    continue
+            
+            return state
+            
+        except Exception as e:
+            print(f"Error in fill_form: {e}")
+            raise
+    
+    
+    
 async def main():
     try:
         # Initialize the auto job applicant
